@@ -1,0 +1,2 @@
+# APK static-analysis working dir: downloaded tools + extracted untrusted APK contents (not source)
+apk_work/
