@@ -1,8 +1,8 @@
 # Static Analysis Report — `Jiffry.apk`
 
-**Analysis type:** Static only. No live server was contacted, no endpoint was called, nothing was attacked. The original APK was copied read-only and never modified.
+**Analysis type:** Static only. Nothing was attacked, no API endpoint was called, and no login was performed. **Part 1** analyses the APK (copied read-only, never modified). **Part 2** (added later, at the user's request) analyses the web app the APK points at — limited to passively downloading the *public* static files a browser fetches on first visit (HTML, web manifest, service worker, the JS/CSS bundle) and reading them offline. No authenticated or state-changing request was made.
 
-**Analyst environment:** Linux container, tools: `apktool 2.10.0`, `jadx 1.5.1`, `unzip`, `strings`, `openssl`, `python3`.
+**Analyst environment:** Linux container, tools: `apktool 2.10.0`, `jadx 1.5.1`, `unzip`, `strings`, `openssl`, `python3`, `curl` (passive GETs of public assets only).
 
 ---
 
@@ -239,3 +239,89 @@ res/       drawable-* (site-settings icon, notification badge, splash)
 ```
 
 **Bottom line:** `Jiffry.apk` is a Google-generated PWA launcher (WebAPK) for `https://admin.jiffrybooking.com/`. To understand "how it's built," the subject of study is that **website/PWA**, not this APK — the APK is just the doorway.
+
+---
+---
+
+# PART 2 — The Web App (`admin.jiffrybooking.com`)
+
+> Added at the user's request. Method: passive download of the **public** static assets only (the files any browser fetches on first visit — `index.html`, `manifest.webmanifest`, `sw.js`, and the Vite JS/CSS bundle), read offline. **No login, no API calls, no probing.** The JS bundle is minified and shipped **without source maps**, so symbol names below are recovered from minified code; endpoint strings and URLs are read verbatim.
+
+## 2.0 TL;DR
+The APK points at the **admin console** of a **bus booking & fleet-management system**. The admin console is a **React single-page app, built with Vite, shipped as a PWA**, served as static files by **nginx**. It talks to a separate backend API at **`https://api.jiffrybooking.com/api`** and opens a **Socket.IO** realtime connection to the same origin. Authentication is a **JWT bearer token kept in `localStorage`**. There are four user roles: **superadmin, admin, agent, conductor**. No secrets or API keys are embedded in the bundle (good hygiene).
+
+## 2.1 App identity (web)
+| Field | Value |
+|---|---|
+| Admin frontend host | `https://admin.jiffrybooking.com/` (nginx/1.31.2, static files) |
+| Backend API | `https://api.jiffrybooking.com/api` (axios `baseURL`) |
+| Realtime | Socket.IO / Engine.IO to `https://api.jiffrybooking.com` (code default fallback: `https://busbooking.vynoqpos.xyz.lk`) |
+| Title / name | "Jiffry Booking System" / short name "Jiffry" |
+| Description (meta) | "Bus booking and fleet management system" |
+| Theme color | `#F97316` (matches the APK) |
+| PWA | `vite-plugin-pwa` + Workbox service worker (`sw.js`), precaches the app shell for offline launch |
+
+> `busbooking.vynoqpos.xyz.lk` appears only as a hard-coded default for the socket URL when the API base can't be derived; `api.jiffrybooking.com` is the real backend. The `.xyz.lk` host looks like an earlier/dev origin — noted, not contacted.
+
+## 2.2 Technology stack (web)
+- **Frontend framework:** React (SPA, client-side routed). Build tool: **Vite** (hashed `assets/index-*.js` / `*.css`, ES-module output).
+- **PWA layer:** `vite-plugin-pwa` with a **Workbox** service worker that precaches the shell (`index.html`, icons, JS/CSS chunks) — this is what lets the WebAPK launch offline.
+- **HTTP:** **axios** (with request/response interceptors) plus some native `fetch`.
+- **Realtime:** **socket.io-client** (Engine.IO) — live updates (likely seat availability / booking status).
+- **PDF / export:** **jsPDF** + **html2canvas** — client-side generation of tickets/receipts/reports.
+- **Sanitisation:** **DOMPurify** (XSS-safe HTML rendering).
+- **UI:** **lucide-react** (icons), **sonner** (toast notifications). No heavyweight UI kit (MUI/antd) detected; styling is via the bundled CSS (likely Tailwind-style, not confirmed).
+- No state-manager library (Redux/Zustand/react-query) detected — state appears to be React-native (context/hooks).
+
+## 2.3 Data layer / backend references
+- **Single API base:** `https://api.jiffrybooking.com/api`. All endpoints below are relative to it.
+- **Client storage** (browser `localStorage`, managed by the web app — nothing in the APK):
+  | Key | Purpose |
+  |---|---|
+  | `jiffry_auth_token` | the JWT bearer token |
+  | `jiffry_remembered_user` | remembered username ("remember me") |
+  | `archivedBusIds` | UI state — JSON list of archived bus IDs |
+- **No bundled DB**, and **no embedded secrets**: scans for Google Maps (`AIza…`), Stripe (`pk_/sk_…`), AWS (`AKIA…`) and generic `apikey/secret` literals all returned **zero**. The server-side database is not observable from the client (as expected).
+
+### API endpoints referenced in the client (paths seen in the bundle)
+Grouped by feature. These are the paths the admin console calls on `…/api`; exact verbs/params aren't shown here because that would require reading network traffic, which wasn't done.
+
+- **Auth:** `/auth/login`, `/auth/logout`, `/auth/me`
+- **Bookings:** `/bookings`, `/bookings/cancelled`, `/bookings/lookup-phone`, `/bookings/bulk-sms`, `/bookings/announcement-sms`
+- **Fleet:** `/buses`, `/buses/archived`, `/routes`, `/trip-schedules`
+- **People:** `/conductors`, `/agents`, `/users/admins`, `/users/conductors`
+- **Agent portal:** `/agent-portal/my-buses`, `/agent-portal/my-quota`, `/agent-portal/quotas/range`, `/agent-portal/users`, `/agent-payments`
+- **Dashboard & reports:** `/dashboard`, `/dashboard/recent`, `/summary`, `/summary/by-agent`, `/summary/by-bus`
+- **Settings:** `/settings`, `/settings/company`, `/settings/pickup-points`, `/settings/templates`
+- **Realtime:** `/socket.io`, `/engine.io`, `/api/socket.io`
+
+> The `bulk-sms` / `announcement-sms` / `settings/templates` endpoints indicate an **SMS gateway integration** for booking confirmations / announcements (templated messages). The provider isn't named client-side.
+
+## 2.4 How it works
+### Screens / flows (SPA routes)
+The console is a client-routed SPA. Its main areas (from route/path strings): **Login → Dashboard** (with "recent" activity), **Bookings** (active, cancelled, phone lookup, bulk/announcement SMS), **Buses** (incl. archived), **Routes**, **Trip schedules**, **Conductors**, **Agents**, an **Agent portal** (an agent's own buses/quota/users/payments), **Reports/Summaries** (by agent, by bus), and **Settings** (company profile, pickup points, SMS templates).
+
+### Auth flow (design level — confirmed from the bundle)
+1. User submits credentials → **`POST /auth/login`**; the response contains a **token** which is saved to `localStorage["jiffry_auth_token"]`.
+2. An **axios request interceptor** reads that token and attaches **`Authorization: Bearer <token>`** to every API request.
+3. **`GET /auth/me`** loads the current user (identity + role) to drive the UI.
+4. An **axios response interceptor** watches for **HTTP 401** and, on an unauthorised response (outside the login call), clears the token and forces re-login.
+5. **`/auth/logout`** ends the session; "remember me" keeps the username (not the password) in `jiffry_remembered_user`.
+
+This is a standard **JWT-in-localStorage** design. (Worth noting for your friend, as a design observation only: tokens in `localStorage` are readable by any script on the page, so the app's XSS posture matters — DOMPurify's presence suggests they're aware of this.)
+
+### Role model (confirmed strings)
+Four roles drive what the UI shows: **`superadmin`**, **`admin`**, **`agent`**, **`conductor`** (a generic `user` also appears). The **agent-portal** endpoints are the agent-scoped slice (an agent sees only *their* buses, quota, sub-users and payments), while admin/superadmin get the full fleet, people-management and reporting screens. Conductors appear to be managed entities (lists under `/conductors`, `/users/conductors`) and likely have a limited operational view. **Important:** client-side roles only decide what's *rendered*; real enforcement must be server-side on `api.jiffrybooking.com` — which can't be verified from the client and wasn't tested.
+
+## 2.5 Running / testing against a backend you control
+Because the real app is the website, "building a debug variant" means running the **web app** locally, not rebuilding the APK:
+1. Get the **frontend repo** (this React/Vite project) and the **backend repo** (whatever serves `api.jiffrybooking.com`) from your friend.
+2. The API base is injected at build time (axios `baseURL`). Point a local build at your own backend via the project's env config (Vite `import.meta.env` / a `.env` with something like `VITE_API_URL=http://localhost:PORT/api`) — **never** at `api.jiffrybooking.com`.
+3. Stand up the backend + a **throwaway local database** (load its migrations/seeds); keep all booking/SMS tests on local, disposable data.
+4. `npm install && npm run dev` to get the console at `http://localhost:…`; PWAs install from localhost if you want the installed-app experience.
+
+## 2.6 What was NOT done (scope guardrails)
+No login attempt, no call to any `/api/*` endpoint, no Socket.IO connection, no path/parameter fuzzing, no access to `api.jiffrybooking.com` or `busbooking.vynoqpos.xyz.lk` at all. Only public static files from `admin.jiffrybooking.com` were downloaded and read offline. Going further (actual request/response shapes, auth hardening, access-control testing) would mean interacting with a live server and should only be done **with the owner's explicit authorisation** and against a backend you control.
+
+## 2.7 Web evidence files
+Saved under `/home/user/Test/apk_work/web/` (gitignored, like the rest of `apk_work/`): `index.html`, `manifest.webmanifest`, `sw.js`, `registerSW.js`, `assets/index-CQO7BLkR.js` (1.39 MB app bundle), `assets/index-C7Tem6dm.css`, `headers.txt`.
