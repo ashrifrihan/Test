@@ -313,12 +313,71 @@ This is a standard **JWT-in-localStorage** design. (Worth noting for your friend
 ### Role model (confirmed strings)
 Four roles drive what the UI shows: **`superadmin`**, **`admin`**, **`agent`**, **`conductor`** (a generic `user` also appears). The **agent-portal** endpoints are the agent-scoped slice (an agent sees only *their* buses, quota, sub-users and payments), while admin/superadmin get the full fleet, people-management and reporting screens. Conductors appear to be managed entities (lists under `/conductors`, `/users/conductors`) and likely have a limited operational view. **Important:** client-side roles only decide what's *rendered*; real enforcement must be server-side on `api.jiffrybooking.com` — which can't be verified from the client and wasn't tested.
 
-## 2.5 Running / testing against a backend you control
-Because the real app is the website, "building a debug variant" means running the **web app** locally, not rebuilding the APK:
-1. Get the **frontend repo** (this React/Vite project) and the **backend repo** (whatever serves `api.jiffrybooking.com`) from your friend.
-2. The API base is injected at build time (axios `baseURL`). Point a local build at your own backend via the project's env config (Vite `import.meta.env` / a `.env` with something like `VITE_API_URL=http://localhost:PORT/api`) — **never** at `api.jiffrybooking.com`.
-3. Stand up the backend + a **throwaway local database** (load its migrations/seeds); keep all booking/SMS tests on local, disposable data.
-4. `npm install && npm run dev` to get the console at `http://localhost:…`; PWAs install from localhost if you want the installed-app experience.
+## 2.5 — SECTION 5: Build / Run for testing (only against a backend you control)
+
+> Critical framing: **there is no native app to rebuild.** "Jiffry" is a WebAPK that just opens the website in Chrome. So this section has two independent parts:
+> - **(A)** run the *existing* APK to look at the current UI (this talks to the **production** server — read-only exploration only);
+> - **(B)** run your *own* copy of the website against a **local** backend + **local** database — the only way to get a test environment you control. This requires the source code.
+
+### (A) Install the existing APK on an emulator to explore the UI
+The WebAPK needs Chrome present, so use a Google-Play emulator image.
+
+1. **Create an AVD with Google Play / Google APIs** (so Chrome exists): Android Studio → Device Manager → create e.g. a Pixel 7, system image API 24+ (app's minSdk is 24), "Google Play" flavour. Or CLI:
+   ```bash
+   sdkmanager "system-images;android-34;google_apis_playstore;x86_64"
+   avdmanager create avd -n jiffry_test -k "system-images;android-34;google_apis_playstore;x86_64"
+   emulator -avd jiffry_test
+   ```
+2. **Install the APK:**
+   ```bash
+   adb install /home/user/Test/apk_work/original/Jiffry.apk
+   # (re-install over an existing copy: adb install -r Jiffry.apk)
+   ```
+3. Ensure Chrome on the emulator is installed/updated (Play image ships it).
+4. Launch **Jiffry**. It opens `https://admin.jiffrybooking.com/` full-screen in Chrome.
+   - ⚠️ This is the **live production site**. You'll hit the real login and real data. Keep it to looking at the login screen / public UI. **Don't create, edit, cancel bookings or send SMS** against production.
+5. Inspect what the web app does, if you want, with **Chrome remote debugging** (not an attack — just DevTools on your own emulator):
+   ```bash
+   # with the app open on the emulator:
+   adb forward tcp:9222 localabstract:chrome_devtools_remote
+   # then open chrome://inspect on your desktop Chrome and inspect the page
+   ```
+
+> You don't even need the APK for this: on any Android Chrome just visit the URL and "Add to Home screen", or open the URL in any desktop browser. Same app.
+
+### (B) Run your own copy against a LOCAL backend + LOCAL database
+This needs **two source repos** from your friend (the APK/website alone don't contain them):
+1. the **frontend** — the React/Vite project that builds `admin.jiffrybooking.com`;
+2. the **backend** — whatever serves `api.jiffrybooking.com/api` (Node/Express/Nest, Laravel/PHP, Django, etc. — unknown until you see it).
+
+**Step 1 — Local database you control.** Run a throwaway DB in Docker, e.g. Postgres:
+```bash
+docker run --name jiffry-db -e POSTGRES_PASSWORD=devpass \
+  -e POSTGRES_DB=jiffry_dev -p 5432:5432 -d postgres:16
+```
+(If the backend uses MySQL, use the `mysql:8` image instead.) Then load **the project's own migrations/seeds** — don't hand-build the schema. Typical commands depending on stack: `npm run migrate && npm run seed`, `php artisan migrate --seed`, `python manage.py migrate`, or `prisma migrate dev`.
+
+**Step 2 — Create your own admin user in the LOCAL db.** Use the project's intended path — a seeder, a `create-admin` CLI/rake/artisan command, or the registration flow — so the password is hashed the way the app expects. This is how you "get access" to *your own* instance: you own the database, so you make yourself a `superadmin` in it. (This is legitimate precisely because it's your local DB, not the production one.)
+
+**Step 3 — Point the backend at the local DB.** Copy its `.env.example` to `.env` and set the DB connection to localhost, e.g.:
+```
+DATABASE_URL=postgres://postgres:devpass@localhost:5432/jiffry_dev
+JWT_SECRET=any-local-dev-secret
+```
+Start it: `npm install && npm run dev` (or the stack's equivalent). Note the port, e.g. `http://localhost:4000`.
+
+**Step 4 — Point the frontend at your local backend.** The API base is injected at build time (axios `baseURL`, read from a Vite env var). Create `.env.local` in the frontend:
+```
+VITE_API_URL=http://localhost:4000/api
+# (exact var name may differ — grep the source for "baseURL" / "import.meta.env")
+```
+Run it: `npm install && npm run dev` → console at `http://localhost:5173`. Log in with the admin user you seeded in step 2. **Never** set this to `api.jiffrybooking.com`.
+
+**Step 5 — Realtime (optional).** Socket.IO derives its URL from the API base, so pointing `VITE_API_URL` at localhost also points the socket at your local backend. Make sure the backend's Socket.IO server and CORS allow `http://localhost:5173`.
+
+**Step 6 — Installed-app experience (optional).** PWAs install from `localhost` over plain HTTP, so Chrome's "Install app" works against your dev server. If you want it on a device/emulator as a home-screen app, serve the local build over HTTPS on your LAN; Chrome will mint a fresh WebAPK for *your* origin, leaving production untouched. You do **not** edit or re-sign the original APK.
+
+**Guardrails for part B:** everything stays on local, disposable data. Don't point any local build at the production API or DB; don't copy production data, tokens, or SMS credentials into your test instance.
 
 ## 2.6 What was NOT done (scope guardrails)
 No login attempt, no call to any `/api/*` endpoint, no Socket.IO connection, no path/parameter fuzzing, no access to `api.jiffrybooking.com` or `busbooking.vynoqpos.xyz.lk` at all. Only public static files from `admin.jiffrybooking.com` were downloaded and read offline. Going further (actual request/response shapes, auth hardening, access-control testing) would mean interacting with a live server and should only be done **with the owner's explicit authorisation** and against a backend you control.
